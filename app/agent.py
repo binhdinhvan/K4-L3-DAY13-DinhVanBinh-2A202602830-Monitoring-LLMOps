@@ -51,7 +51,7 @@ class LabAgent:
             },
         ):
             started = time.perf_counter()
-            docs = retrieve(message)
+            docs = self._traced_retrieve(message)
             prompt = resolve_prompt(
                 langfuse_client,
                 feature=feature,
@@ -71,10 +71,11 @@ class LabAgent:
                 },
                 version=prompt.version,
             )
-            # TODO (CP2): instrument retrieve() and FakeLLM.generate() as child
-            # observations. The nested generation must receive prompt, usage and cost.
-            with propagate_attributes(prompt=prompt.managed_prompt):
-                response = self.llm.generate(prompt.text)
+            response = self._traced_generate(
+                prompt_text=prompt.text,
+                managed_prompt=prompt.managed_prompt,
+                prompt_version=prompt.version,
+            )
             quality_score = self._heuristic_quality(message, response.text, docs)
             latency_ms = int((time.perf_counter() - started) * 1000)
             cost_usd = self._estimate_cost(response.usage.input_tokens, response.usage.output_tokens)
@@ -102,6 +103,53 @@ class LabAgent:
         input_cost = (tokens_in / 1_000_000) * 3
         output_cost = (tokens_out / 1_000_000) * 15
         return round(input_cost + output_cost, 6)
+
+    @observe(name="retrieval", as_type="retriever", capture_input=False, capture_output=False)
+    def _traced_retrieve(self, message: str) -> list[str]:
+        docs = retrieve(message)
+        client = get_langfuse_client()
+        if hasattr(client, "update_current_span"):
+            try:
+                client.update_current_span(
+                    metadata={
+                        "query_preview": summarize_text(message),
+                        "doc_count": len(docs),
+                    }
+                )
+            except Exception:
+                pass
+        return docs
+
+    @observe(name="generation", as_type="generation", capture_input=False, capture_output=False)
+    def _traced_generate(
+        self, prompt_text: str, managed_prompt: Any, prompt_version: str
+    ) -> FakeResponse:
+        with propagate_attributes(prompt=managed_prompt):
+            response = self.llm.generate(prompt_text)
+
+        cost_usd = self._estimate_cost(response.usage.input_tokens, response.usage.output_tokens)
+        client = get_langfuse_client()
+        if hasattr(client, "update_current_generation"):
+            try:
+                client.update_current_generation(
+                    model=self.model,
+                    prompt=managed_prompt,
+                    version=prompt_version,
+                    usage_details={
+                        "input": response.usage.input_tokens,
+                        "output": response.usage.output_tokens,
+                        "total": response.usage.input_tokens + response.usage.output_tokens,
+                    },
+                    cost_details={"total": cost_usd},
+                    metadata={
+                        "cost_usd": cost_usd,
+                        "ttft_ms": response.ttft_ms,
+                        "answer_preview": summarize_text(response.text),
+                    },
+                )
+            except Exception:
+                pass
+        return response
 
     def _heuristic_quality(self, question: str, answer: str, docs: list[str]) -> float:
         score = 0.5
